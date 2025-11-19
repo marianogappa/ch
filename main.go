@@ -1,51 +1,113 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 
-	"github.com/marianogappa/ch/chartjs"
-	"github.com/marianogappa/ch/dataset"
-	"github.com/marianogappa/ch/format"
-	"github.com/skratchdot/open-golang/open"
+	"github.com/marianogappa/ch/pkg/ch"
+	"github.com/marianogappa/ch/pkg/input"
+	"github.com/marianogappa/ch/pkg/llm"
+	_ "github.com/marianogappa/ch/pkg/output" // Register outputs
+	"github.com/marianogappa/ch/pkg/parser"
 )
 
 func main() {
+	if err := Run(os.Args, os.Stdin); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func Run(args []string, stdin io.Reader) error {
+	// 1. Parse global flags to determine output driver and common options
+	outputName := "chartjs" // default
+	for i, arg := range args {
+		if (arg == "--output" || arg == "-o") && i+1 < len(args) {
+			outputName = args[i+1]
+			break
+		}
+	}
+
+	outDriver, err := ch.GetOutput(outputName)
+	if err != nil {
+		return fmt.Errorf("error: %v. Available outputs: %v", err, ch.Outputs())
+	}
+
+	// Setup FlagSet
+	fs := flag.NewFlagSet("ch", flag.ContinueOnError)
+
+	// Global flags
 	var (
-		opts           = mustResolveOptions(os.Args[1:])
-		rd   io.Reader = os.Stdin
-		err  error
+		separator     string
+		dateFormat    string
+		rawLineFormat string
+		interactive   bool
+		apiKey        string
 	)
-	if opts.rawLineFormat == "" {
-		rd, opts.lineFormat = format.Parse(rd, opts.separator, opts.dateFormat)
+
+	fs.StringVar(&separator, "separator", "\t", "Column separator")
+	fs.StringVar(&dateFormat, "date-format", "", "Date format")
+	fs.StringVar(&rawLineFormat, "format", "", "Line format (e.g. 'sfd')")
+	fs.BoolVar(&interactive, "interactive", false, "Interactive mode (LLM)")
+	fs.StringVar(&apiKey, "api-key", "", "LLM API Key")
+
+	// Register output flags
+	outConfig := outDriver.RegisterFlags(fs)
+
+	// Parse
+	var dummyOutput string
+	fs.StringVar(&dummyOutput, "output", "chartjs", "Output driver")
+	fs.StringVar(&dummyOutput, "o", "chartjs", "Output driver")
+
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
 	}
-	dataset := dataset.MustNew(rd, opts.lineFormat)
-	if !opts.lineFormat.HasFloats && !opts.lineFormat.HasDateTimes && opts.lineFormat.HasStrings {
-		dataset.FSS, dataset.SSS, opts.lineFormat = preprocessFreq(dataset.SSS, opts.lineFormat)
+
+	// 2. Setup Input
+	in := input.NewReaderInput(stdin)
+
+	// 3. Setup Parser
+	sepRune := []rune(separator)[0] // simplistic
+	if separator == "\\t" {
+		sepRune = '\t'
+	} // handle escaped tab from shell
+
+	p := parser.NewCSVParser(sepRune, dateFormat)
+	if rawLineFormat != "" {
+		p.LineFormat = rawLineFormat
 	}
-	if opts.chartType, err = resolveChartType(opts.chartType, opts.lineFormat, dataset.Len()); opts.debug || err != nil {
-		fmt.Println(renderDebug(*dataset, opts, err))
-		os.Exit(0)
+
+	// 4. Interactive Mode
+	if interactive {
+		if apiKey == "" {
+			apiKey = os.Getenv("OPENAI_API_KEY")
+		}
+		if apiKey == "" {
+			return fmt.Errorf("interactive mode requires OPENAI_API_KEY")
+		}
+		client := llm.NewOpenAIClient(apiKey)
+		controller := llm.NewController(client)
+		_ = controller
+		fmt.Println("Interactive mode enabled (Mocked)")
+		// TODO: Implement full interactive flow
 	}
-	chart := chartjs.New(
-		chartjs.NewChartType(opts.chartType.String()),
-		*dataset,
-		chartjs.Options{
-			Title:     opts.title,
-			ScaleType: chartjs.NewScaleType(opts.scaleType.String()),
-			XLabel:    opts.xLabel,
-			YLabel:    opts.yLabel,
-			ZeroBased: opts.zeroBased,
-			ColorType: chartjs.NewColorType(opts.colorType.String()),
-		},
-	)
-	tmpfile := mustNewTempFile()
-	chart.MustBuild(chartjs.OutputAll, tmpfile.f)
-	tmpfile.mustClose()
-	tmpfile.mustRenameWithHTMLSuffix()
-	if err := open.Run(tmpfile.url()); err != nil {
-		log.Fatalf("Could not open the default viewer; please configure open/xdg-open: %v", err)
+
+	// 5. Run
+	stream, err := in.Stream()
+	if err != nil {
+		return fmt.Errorf("error creating input stream: %v", err)
 	}
+
+	rows, err := p.Parse(stream)
+	if err != nil {
+		return fmt.Errorf("error creating parser: %v", err)
+	}
+
+	if err := outDriver.Render(rows, outConfig); err != nil {
+		return fmt.Errorf("error rendering output: %v", err)
+	}
+
+	return nil
 }
