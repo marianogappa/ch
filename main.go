@@ -10,7 +10,9 @@ import (
 	"github.com/marianogappa/ch/pkg/ch"
 	"github.com/marianogappa/ch/pkg/input"
 	"github.com/marianogappa/ch/pkg/llm"
-	_ "github.com/marianogappa/ch/pkg/output" // Register outputs
+	_ "github.com/marianogappa/ch/pkg/output/chartjs"
+	_ "github.com/marianogappa/ch/pkg/output/d3"
+	_ "github.com/marianogappa/ch/pkg/output/json"
 	"github.com/marianogappa/ch/pkg/parser"
 )
 
