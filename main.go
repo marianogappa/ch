@@ -3,85 +3,107 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 
 	"github.com/marianogappa/ch/pkg/ch"
 	"github.com/marianogappa/ch/pkg/input"
 	"github.com/marianogappa/ch/pkg/llm"
-	_ "github.com/marianogappa/ch/pkg/output/chartjs"
-	_ "github.com/marianogappa/ch/pkg/output/d3"
-	_ "github.com/marianogappa/ch/pkg/output/json"
+	"github.com/marianogappa/ch/pkg/output"
+	_ "github.com/marianogappa/ch/pkg/output/drivers/chartjs"
+	_ "github.com/marianogappa/ch/pkg/output/drivers/d3"
+	_ "github.com/marianogappa/ch/pkg/output/drivers/debug"
 	"github.com/marianogappa/ch/pkg/parser"
+	"github.com/spf13/cobra"
+)
+
+var (
+	outputName  string
+	separator   string
+	dateFormat  string
+	lineFormat  string
+	interactive bool
+	apiKey      string
 )
 
 func main() {
-	if err := Run(os.Args, os.Stdin); err != nil {
+	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func Run(args []string, stdin io.Reader) error {
-	// 1. Parse global flags to determine output driver and common options
-	outputName := "chartjs" // default
-	for i, arg := range args {
-		if (arg == "--output" || arg == "-o") && i+1 < len(args) {
-			outputName = args[i+1]
-			break
-		}
-	}
+var rootCmd = &cobra.Command{
+	Use:   "ch",
+	Short: "Chart data from stdin",
+	Long:  "Chart data from stdin with various output formats",
+	RunE:  run,
+}
 
+var chartConfig *output.ChartConfig
+var parseChartConfigFunc func(outputName string) error
+
+func init() {
+	// Global flags
+	rootCmd.PersistentFlags().StringVarP(&outputName, "output", "o", "chartjs", "Output driver (chartjs, d3, debug)")
+	rootCmd.PersistentFlags().StringVar(&separator, "separator", "\t", "Column separator")
+	rootCmd.PersistentFlags().StringVar(&dateFormat, "date-format", "", "Date format")
+	rootCmd.PersistentFlags().StringVar(&lineFormat, "format", "", "Line format (e.g. 'sfd')")
+	rootCmd.PersistentFlags().BoolVar(&interactive, "interactive", false, "Interactive mode (LLM)")
+	rootCmd.PersistentFlags().StringVar(&apiKey, "api-key", "", "LLM API Key")
+
+	// Register all chart config flags (generic + all frontend-specific with prefixes)
+	chartConfig, parseChartConfigFunc = output.RegisterAllFlags(rootCmd.PersistentFlags())
+}
+
+func run(cmd *cobra.Command, args []string) error {
+	// Get output driver
 	outDriver, err := ch.GetOutput(outputName)
 	if err != nil {
 		return fmt.Errorf("error: %v. Available outputs: %v", err, ch.Outputs())
 	}
 
-	// Setup FlagSet
-	fs := flag.NewFlagSet("ch", flag.ContinueOnError)
+	// All current drivers implement ChartOutput
+	var chartOutput output.ChartOutput
 
-	// Global flags
-	var (
-		separator     string
-		dateFormat    string
-		rawLineFormat string
-		interactive   bool
-		apiKey        string
-	)
+	if output.IsChartOutput(outDriver) {
+		chartOutput = outDriver.(output.ChartOutput)
+	} else {
+		// Fallback for drivers that don't implement ChartOutput
+		// Convert pflag to flag.FlagSet for compatibility
+		fs := flag.NewFlagSet("ch", flag.ContinueOnError)
+		// Note: This won't work perfectly, but it's a fallback
+		// Drivers should implement ChartOutput
+		_ = outDriver.RegisterFlags(fs)
+		return fmt.Errorf("driver %s does not implement ChartOutput", outputName)
+	}
 
-	fs.StringVar(&separator, "separator", "\t", "Column separator")
-	fs.StringVar(&dateFormat, "date-format", "", "Date format")
-	fs.StringVar(&rawLineFormat, "format", "", "Line format (e.g. 'sfd')")
-	fs.BoolVar(&interactive, "interactive", false, "Interactive mode (LLM)")
-	fs.StringVar(&apiKey, "api-key", "", "LLM API Key")
-
-	// Register output flags
-	outConfig := outDriver.RegisterFlags(fs)
-
-	// Parse
-	var dummyOutput string
-	fs.StringVar(&dummyOutput, "output", "chartjs", "Output driver")
-	fs.StringVar(&dummyOutput, "o", "chartjs", "Output driver")
-
-	if err := fs.Parse(args[1:]); err != nil {
+	// Parse flags
+	if err := cmd.ParseFlags(args); err != nil {
 		return err
 	}
 
-	// 2. Setup Input
-	in := input.NewReaderInput(stdin)
+	// Call parse function for special cases (like Colors) and populate frontend settings
+	if parseChartConfigFunc != nil {
+		if err := parseChartConfigFunc(outputName); err != nil {
+			return err
+		}
+	}
 
-	// 3. Setup Parser
+	// Setup Input
+	in := input.NewReaderInput(os.Stdin)
+
+	// Setup Parser
 	sepRune := []rune(separator)[0] // simplistic
 	if separator == "\\t" {
 		sepRune = '\t'
 	} // handle escaped tab from shell
 
 	p := parser.NewCSVParser(sepRune, dateFormat)
-	if rawLineFormat != "" {
-		p.LineFormat = rawLineFormat
+	if lineFormat != "" {
+		p.LineFormat = lineFormat
 	}
 
-	// 4. Interactive Mode
+	// Interactive Mode
 	if interactive {
 		if apiKey == "" {
 			apiKey = os.Getenv("OPENAI_API_KEY")
@@ -96,7 +118,7 @@ func Run(args []string, stdin io.Reader) error {
 		// TODO: Implement full interactive flow
 	}
 
-	// 5. Run
+	// Run
 	stream, err := in.Stream()
 	if err != nil {
 		return fmt.Errorf("error creating input stream: %v", err)
@@ -107,8 +129,13 @@ func Run(args []string, stdin io.Reader) error {
 		return fmt.Errorf("error creating parser: %v", err)
 	}
 
-	if err := outDriver.Render(rows, outConfig); err != nil {
-		return fmt.Errorf("error rendering output: %v", err)
+	// Render using ChartConfig
+	if chartConfig != nil && chartOutput != nil {
+		if err := chartOutput.RenderChart(rows, chartConfig); err != nil {
+			return fmt.Errorf("error rendering output: %v", err)
+		}
+	} else {
+		return fmt.Errorf("chart config not available")
 	}
 
 	return nil
